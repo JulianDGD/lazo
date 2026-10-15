@@ -138,10 +138,11 @@ internal static class ControlSmoke
             session.RevokeAll();
             ok &= Check(await Until(() => window.Granted == 0 && session.Controller == null && !session.AnyGranted, 3000), "quitar permisos llega al visor");
 
-            // Sin permiso, un trazo del visor se ignora.
+            // Sin permiso, un trazo del visor se ignora. (El borrado anterior ya contó como operación del visor.)
+            int acceptedBefore = fromViewer;
             window.Layer.Commit(Stroke(33, AnnotationTool.Box, 0.6, 0.6, 0.8, 0.8));
             await Task.Delay(600);
-            ok &= Check(hostLayer.Children.Count == 1 && fromViewer == 1, "sin permiso, los trazos del visor no se aceptan");
+            ok &= Check(hostLayer.Children.Count == 1 && fromViewer == acceptedBefore, "sin permiso, los trazos del visor no se aceptan");
 
             hostLayer.Commit(new AnnotationOp { Kind = AnnotationOp.Clear });
             ok &= Check(await Until(() => window.Layer.Children.Count == 0, 3000), "borrar todo llega al visor");

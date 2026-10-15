@@ -86,6 +86,29 @@ internal static class NetworkSmoke
 
             Peer target = new Peer { Id = receiver.SelfId, Name = "Receptor", Address = local, Port = receiverPort, Fingerprint = receiver.SelfFingerprint };
 
+            // Alguien se adelanta con el identificador de un compañero que se anuncia con otra clave: se rechaza y no se recuerda.
+            string victimProfile = Path.Combine(directory, "perfil-adelantado");
+            Directory.CreateDirectory(victimProfile);
+            File.WriteAllText(Path.Combine(victimProfile, "device.id"), remoteId.ToString("D"));
+            using (NetworkEngine early = new NetworkEngine(Path.Combine(directory, "recibidos-adelantado"), FreeUdp(), FreePort(), victimProfile))
+            {
+                bool refused = false;
+                try { await early.SendChatAsync(target, "me hago pasar por otro"); }
+                catch (Exception) { refused = true; }
+                Check(refused && chat == null && receiver.Pairings.Get(remoteId.ToString("D")) == null,
+                    "quien usa el identificador de un compañero anunciado con otra clave es rechazado");
+            }
+
+            // El emisor se anuncia, como hace cada 2,5 s: así el receptor puede confirmar su clave al primer contacto.
+            using (UdpClient announcer = new UdpClient(new IPEndPoint(local, 0)))
+            {
+                TaskCompletionSource<bool> seen = new TaskCompletionSource<bool>();
+                receiver.PeersChanged += peers => { if (peers.Any(p => p.Id == sender.SelfId)) seen.TrySetResult(true); };
+                byte[] packet = Encoding.UTF8.GetBytes("LAZO3|" + sender.SelfId + "|Emisor|" + receiverPort + "|" + sender.SelfFingerprint);
+                announcer.Send(packet, packet.Length, new IPEndPoint(local, receiverUdp));
+                await Expect(seen.Task, 3000, "el receptor ve el anuncio del emisor");
+            }
+
             // Primer contacto: se recuerdan las claves sin pedir ningún código.
             int prompts = 0;
             bool acceptCode = false;

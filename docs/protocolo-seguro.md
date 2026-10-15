@@ -55,10 +55,18 @@ La secuencia empieza en 0 en cada sentido y sube en 1 por registro. Se comprueba
 
 Primer registro, servidor → cliente: `u8` estado.
 
-- `1`: identidad aceptada. Si el servidor no conocía al cliente, acaba de guardar su clave.
-- `2`: el servidor tiene ese identificador con otra clave. Cierra.
+- `1`: identidad aceptada. Si el servidor no conocía al cliente, puede haber guardado su clave (ver abajo).
+- `2`: el servidor tiene ese identificador con otra clave, o el cliente usa el identificador de un equipo que se anuncia con otra huella. Cierra.
 
-El cliente aplica la misma regla: si no conocía al servidor, guarda su clave; si la conocía y es otra, cierra sin enviar nada. Ninguna operación pide código.
+Primer contacto en el servidor (Windows desde 0.5.0): se contrasta con el último anuncio UDP de ese identificador.
+
+- Huella anunciada distinta de la del saludo: suplantación, estado `2`.
+- Misma huella y la conexión llega desde la dirección del anuncio: se guarda la clave.
+- Sin anuncio, o desde otra dirección: se atiende la operación sin guardar la clave.
+
+Así nadie puede adelantarse con el identificador de un compañero (que se ve en los anuncios) y quedar guardado en su lugar.
+
+El cliente aplica la misma regla: si conocía al servidor y la clave es otra, cierra sin enviar nada; si no lo conocía, la clave del saludo debe coincidir con la huella anunciada, y solo entonces se guarda. Ninguna operación pide código.
 
 ## Operaciones (cliente → servidor, dentro del canal)
 

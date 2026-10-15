@@ -362,8 +362,20 @@ namespace Lazo
                         stream.Flush();
                         return;
                     }
-                    // Primer contacto: se recuerda su clave sin preguntar (como SSH). Si un día cambia, se rechaza.
-                    if (known == null) Pairings.Set(session.PeerId, session.PeerFingerprint, NameOf(session.PeerId));
+                    if (known == null)
+                    {
+                        // Primer contacto: se recuerda su clave sin preguntar (como SSH), pero solo si coincide con lo que
+                        // ese equipo anuncia desde esa misma dirección. Así nadie puede adelantarse con el identificador
+                        // de un compañero (se ve en los anuncios) y quedar guardado en su lugar.
+                        FirstContact contact = CheckFirstContact(session.PeerId, session.PeerFingerprint, address);
+                        if (contact == FirstContact.Conflict)
+                        {
+                            stream.WriteByte(StatusMismatch);
+                            stream.Flush();
+                            return;
+                        }
+                        if (contact == FirstContact.Confirmed) Pairings.Set(session.PeerId, session.PeerFingerprint, NameOf(session.PeerId));
+                    }
                     stream.WriteByte(StatusKnown);
                     stream.Flush();
                     client.ReceiveTimeout = 120000;
@@ -391,6 +403,24 @@ namespace Lazo
                 {
                     if (session != null) try { session.Stream.Dispose(); } catch { }
                 }
+            }
+        }
+
+        private enum FirstContact { Confirmed, Unconfirmed, Conflict }
+
+        /// <summary>
+        /// Contrasta un equipo desconocido con su anuncio. Huella anunciada distinta: suplantación, se rechaza.
+        /// Misma huella y misma dirección: se recuerda. Sin anuncio u otra dirección: se atiende sin recordarlo.
+        /// </summary>
+        private FirstContact CheckFirstContact(string id, string fingerprint, IPAddress address)
+        {
+            Guid guid;
+            Peer peer;
+            lock (_peerLock)
+            {
+                if (!Guid.TryParse(id, out guid) || !_peers.TryGetValue(guid, out peer)) return FirstContact.Unconfirmed;
+                if (peer.Fingerprint != fingerprint) return FirstContact.Conflict;
+                return peer.Address.Equals(address) ? FirstContact.Confirmed : FirstContact.Unconfirmed;
             }
         }
 
@@ -480,11 +510,15 @@ namespace Lazo
                 if (session.PeerId != expected) throw new InvalidOperationException("Respondió un equipo distinto del esperado.");
                 if (known != null && known.Fingerprint != session.PeerFingerprint)
                     throw new IdentityChangedException("La identidad de " + peer.Name + " cambió. Si reinstaló Lazo, olvídalo en Ajustes › Equipos conocidos.");
+                // Primer contacto: la clave debe ser la que anuncia ese equipo.
+                bool announced = !string.IsNullOrEmpty(peer.Fingerprint);
+                if (known == null && announced && peer.Fingerprint != session.PeerFingerprint)
+                    throw new IdentityChangedException("Respondió en nombre de " + peer.Name + " un equipo con otra identidad. No se envió nada.");
                 int status = session.Stream.ReadByte();
                 if (status == StatusMismatch)
                     throw new IdentityChangedException(peer.Name + " tiene guardada otra identidad de este equipo. Debe olvidarlo en sus Ajustes.");
                 if (status != StatusKnown) throw new EndOfStreamException();
-                if (known == null) Pairings.Set(expected, session.PeerFingerprint, peer.Name);
+                if (known == null && announced) Pairings.Set(expected, session.PeerFingerprint, peer.Name);
                 client.ReceiveTimeout = 120000;
                 return new SecureConnection { Client = client, Stream = session.Stream, PeerId = session.PeerId, Transcript = session.Transcript, Fingerprint = session.PeerFingerprint };
             }
