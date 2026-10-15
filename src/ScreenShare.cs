@@ -18,12 +18,11 @@ using System.Windows.Threading;
 namespace Lazo
 {
     /// <summary>
-    /// Transmisión de pantalla hacia uno o varios compañeros.
-    /// Protocolo tras aceptar LAZOS: 'S' ancho alto · 'F' cursorX cursorY n [x y w h len jpeg]… · 'K' · 'E'.
+    /// Transmisión de pantalla hacia uno o varios compañeros, por el canal cifrado LAZO3 (docs/protocolo-seguro.md).
+    /// Emisor → visor: 'S' ancho alto · 'F' cursorX cursorY n [x y w h len jpeg]… · 'K' · 'E' ·
+    /// 'H' versión · 'P' permisos · 'D' rechazo · 'A' len trazo.
+    /// Visor → emisor: 'H' versión · 'R' permiso · 'A' len trazo · 'I' entrada.
     /// El ritmo lo marca el receptor más lento: no hay colas, así que la latencia se mantiene mínima.
-    /// Canal de retorno (visor → emisor): 'H' versión · 'R' permiso · 'A' len trazo · 'I' entrada.
-    /// Solo a quien saludó con 'H' se le envían 'H' · 'P' permisos · 'D' rechazo · 'A' len trazo;
-    /// así las versiones anteriores, que no saludan, siguen recibiendo exactamente lo mismo que antes.
     /// </summary>
     internal sealed class ScreenShareSession
     {
@@ -31,8 +30,8 @@ namespace Lazo
         {
             public int Id;
             public string Name;
-            public TcpClient Client;
-            public NetworkStream Stream;
+            public SecureConnection Connection;
+            public Stream Stream;
             public readonly object WriteLock = new object();
             public volatile bool Capable;
             public volatile byte Granted;
@@ -52,19 +51,24 @@ namespace Lazo
         // Permisos, trazos y entrada remota se procesan en orden en un solo hilo, fuera de la interfaz.
         private readonly System.Collections.Concurrent.BlockingCollection<Action> _control = new System.Collections.Concurrent.BlockingCollection<Action>();
         private readonly AnnotationModel _annotations = new AnnotationModel();
+        // Autor de cada trazo: 0 es quien comparte. Quien mira solo puede tocar los suyos.
+        private readonly Dictionary<int, int> _owners = new Dictionary<int, int>();
         private readonly RemoteInputInjector _injector;
-        private long _lastRemoteInput;
 
         public ShareSource Source { get; private set; }
         public double Fps { get; private set; }
         public double Mbps { get; private set; }
         public double WorkMs { get; private set; }
         public double CaptureMs { get; private set; }
+        /// <summary>Mientras quien comparte dibuja, la entrada remota se descarta: el clic acabaría en la capa de dibujo.</summary>
+        public volatile bool InputPaused;
         public event Action Changed;
         public event Action<string> Notice;
         public event Action Ended;
         /// <summary>Alguien que mira pide un permiso: id del visor, nombre y <see cref="SharePermission"/>.</summary>
         public event Action<int, string, byte> PermissionRequested;
+        /// <summary>Alguien dejó de mirar; sus avisos de permiso pendientes ya no sirven.</summary>
+        public event Action<int> ViewerLeft;
         /// <summary>Trazo hecho por alguien que mira, ya validado; hay que pintarlo en la superposición.</summary>
         public event Action<AnnotationOp> Annotated;
 
@@ -77,24 +81,29 @@ namespace Lazo
             control.Start();
         }
 
-        /// <summary>Nombre de quien controla ahora el equipo, o null.</summary>
+        /// <summary>Quién controla ahora el equipo y en qué modo, o null.</summary>
         public string Controller
         {
-            get { lock (_lock) { Viewer v = _viewers.FirstOrDefault(x => (x.Granted & SharePermission.Control) != 0); return v == null ? null : v.Name; } }
+            get
+            {
+                lock (_lock)
+                {
+                    Viewer v = _viewers.FirstOrDefault(x => (x.Granted & SharePermission.Control) != 0);
+                    if (v == null) return null;
+                    return v.Name + ((v.Granted & SharePermission.FullControl) != 0 ? " (control total)" : " (ventana activa)");
+                }
+            }
         }
 
-        public string[] Drawers()
+        public bool ControlActive
         {
-            lock (_lock) return _viewers.Where(v => (v.Granted & SharePermission.Draw) != 0).Select(v => v.Name).ToArray();
+            get { lock (_lock) return _viewers.Any(v => (v.Granted & SharePermission.Control) != 0); }
         }
 
         public bool AnyGranted
         {
             get { lock (_lock) return _viewers.Any(v => v.Granted != 0); }
         }
-
-        /// <summary>Momento (ticks UTC) de la última entrada remota reproducida.</summary>
-        public DateTime LastRemoteInputUtc { get { return new DateTime(Interlocked.Read(ref _lastRemoteInput), DateTimeKind.Utc); } }
 
         public string[] ViewerNames()
         {
@@ -111,9 +120,9 @@ namespace Lazo
             {
                 try
                 {
-                    TcpClient client = await _network.OpenScreenAsync(peer, Source.Label).ConfigureAwait(false);
-                    if (!_running) { client.Close(); return; }
-                    Viewer viewer = new Viewer { Id = Interlocked.Increment(ref _nextViewer), Name = peer.Name, Client = client, Stream = client.GetStream() };
+                    SecureConnection connection = await _network.OpenScreenAsync(peer, Source.Label).ConfigureAwait(false);
+                    if (!_running) { connection.Dispose(); return; }
+                    Viewer viewer = new Viewer { Id = Interlocked.Increment(ref _nextViewer), Name = peer.Name, Connection = connection, Stream = connection.Stream };
                     lock (_lock) _viewers.Add(viewer);
                     new Thread(() => ReadBack(viewer)) { IsBackground = true, Name = "Lazo screen back-channel" }.Start();
                     Interlocked.Exchange(ref _key, 1);
@@ -144,12 +153,23 @@ namespace Lazo
             Post(() =>
             {
                 if (!_annotations.Apply(op)) return;
+                Track(op, 0);
                 Relay(op, null);
             });
         }
 
-        /// <summary>Respuesta de quien comparte a una petición de permiso.</summary>
-        public void Answer(int viewerId, byte kind, bool accept)
+        private void Track(AnnotationOp op, int owner)
+        {
+            if (op.Kind == AnnotationOp.Begin) _owners[op.Id] = owner;
+            else if (op.Kind == AnnotationOp.Erase) _owners.Remove(op.Id);
+            else if (op.Kind == AnnotationOp.Clear) _owners.Clear();
+        }
+
+        /// <summary>
+        /// Respuesta de quien comparte a una petición de permiso. Para el control, <paramref name="full"/>
+        /// concede el equipo completo; si no, solo la ventana activa.
+        /// </summary>
+        public void Answer(int viewerId, byte kind, bool accept, bool full = false)
         {
             Post(() =>
             {
@@ -158,7 +178,13 @@ namespace Lazo
                 lock (viewer.Asked) viewer.Asked.Remove(kind);
                 if (accept && kind == SharePermission.Control && ControllerOther(viewer) != null) accept = false;
                 if (!accept) { Write(viewer, new[] { (byte)'D', kind }); return; }
-                SetGranted(viewer, (byte)(viewer.Granted | kind));
+                byte granted = (byte)(viewer.Granted | kind);
+                if (kind == SharePermission.Control)
+                {
+                    granted = full ? (byte)(granted | SharePermission.FullControl) : (byte)(granted & ~SharePermission.FullControl);
+                    _injector.Configure(full);
+                }
+                SetGranted(viewer, granted);
             });
         }
 
@@ -173,20 +199,9 @@ namespace Lazo
             });
         }
 
-        /// <summary>Quita solo el control remoto; dibujar sigue permitido.</summary>
-        public void RevokeControl()
-        {
-            Post(() =>
-            {
-                Viewer[] all;
-                lock (_lock) all = _viewers.ToArray();
-                foreach (Viewer viewer in all)
-                    if ((viewer.Granted & SharePermission.Control) != 0) SetGranted(viewer, (byte)(viewer.Granted & ~SharePermission.Control));
-            });
-        }
-
         private void SetGranted(Viewer viewer, byte granted)
         {
+            if ((granted & SharePermission.Control) == 0) granted = (byte)(granted & ~SharePermission.FullControl);
             bool hadControl = (viewer.Granted & SharePermission.Control) != 0;
             viewer.Granted = granted;
             if (hadControl && (granted & SharePermission.Control) == 0) _injector.ReleaseAll();
@@ -243,10 +258,26 @@ namespace Lazo
             WriteTo(viewer, packet, packet.Length);
         }
 
-        /// <summary>
-        /// Lee lo que envía cada visor. Las versiones anteriores no envían nada y este hilo
-        /// solo espera hasta que se cierre la conexión.
-        /// </summary>
+        /// <summary>Un trazo de quien mira: solo puede crear trazos nuevos y cambiar o borrar los suyos.</summary>
+        private void ApplyFromViewer(Viewer viewer, AnnotationOp op)
+        {
+            if ((viewer.Granted & SharePermission.Draw) == 0 || op.Kind == AnnotationOp.Clear) return;
+            int owner;
+            if (op.Kind != AnnotationOp.Begin && (!_owners.TryGetValue(op.Id, out owner) || owner != viewer.Id)) return;
+            if (!_annotations.Apply(op))
+            {
+                // Rechazado (id repetido o límite): se le quita a quien lo dibujó para que no vea algo que nadie más ve.
+                if (op.Kind == AnnotationOp.Begin && !_owners.ContainsKey(op.Id))
+                    Write(viewer, Framed((byte)'A', new AnnotationOp { Kind = AnnotationOp.Erase, Id = op.Id }.ToBytes()));
+                return;
+            }
+            Track(op, viewer.Id);
+            Relay(op, viewer);
+            Action<AnnotationOp> handler = Annotated;
+            if (handler != null) handler(op);
+        }
+
+        /// <summary>Lee lo que envía cada visor hasta que se cierre la conexión.</summary>
         private void ReadBack(Viewer viewer)
         {
             try
@@ -280,14 +311,7 @@ namespace Lazo
                         if (data.Length != length) break;
                         AnnotationOp op = AnnotationOp.Parse(data);
                         if (op == null) continue;
-                        Post(() =>
-                        {
-                            if ((viewer.Granted & SharePermission.Draw) == 0 || op.Kind == AnnotationOp.Clear) return;
-                            if (!_annotations.Apply(op)) return;
-                            Relay(op, viewer);
-                            Action<AnnotationOp> handler = Annotated;
-                            if (handler != null) handler(op);
-                        });
+                        Post(() => ApplyFromViewer(viewer, op));
                     }
                     else if (type == (byte)'I')
                     {
@@ -295,9 +319,8 @@ namespace Lazo
                         if (!RemoteInputEvent.Read(reader, out input)) break;
                         Post(() =>
                         {
-                            if ((viewer.Granted & SharePermission.Control) == 0 || !_running) return;
+                            if ((viewer.Granted & SharePermission.Control) == 0 || !_running || InputPaused) return;
                             _injector.Apply(input);
-                            Interlocked.Exchange(ref _lastRemoteInput, DateTime.UtcNow.Ticks);
                         });
                     }
                     else break;
@@ -311,6 +334,9 @@ namespace Lazo
                     if ((viewer.Granted & SharePermission.Control) != 0) _injector.ReleaseAll();
                     viewer.Granted = 0;
                     viewer.Capable = false;
+                    lock (viewer.Asked) viewer.Asked.Clear();
+                    Action<int> left = ViewerLeft;
+                    if (left != null) left(viewer.Id);
                     Raise(Changed);
                 });
             }
@@ -458,8 +484,8 @@ namespace Lazo
                 lock (_lock) { rest = _viewers.ToArray(); _viewers.Clear(); }
                 foreach (Viewer viewer in rest)
                 {
-                    try { lock (viewer.WriteLock) viewer.Stream.Write(new[] { (byte)'E' }, 0, 1); } catch { }
-                    try { viewer.Client.Close(); } catch { }
+                    try { lock (viewer.WriteLock) { viewer.Stream.Write(new[] { (byte)'E' }, 0, 1); viewer.Stream.Flush(); } } catch { }
+                    viewer.Connection.Dispose();
                 }
                 Raise(Ended);
             }
@@ -504,12 +530,12 @@ namespace Lazo
         /// <summary>Fotogramas y paquetes de control comparten la conexión; cada escritura va entera.</summary>
         private void WriteTo(Viewer viewer, byte[] buffer, int length)
         {
-            try { lock (viewer.WriteLock) viewer.Stream.Write(buffer, 0, length); }
+            try { lock (viewer.WriteLock) { viewer.Stream.Write(buffer, 0, length); viewer.Stream.Flush(); } }
             catch
             {
                 bool removed;
                 lock (_lock) removed = _viewers.Remove(viewer);
-                try { viewer.Client.Close(); } catch { }
+                viewer.Connection.Dispose();
                 if (!removed) return;
                 Say(viewer.Name + " dejó de ver tu pantalla");
                 Raise(Changed);
@@ -724,7 +750,7 @@ namespace Lazo
             };
             Canvas overlay = new Canvas { IsHitTestVisible = false };
             overlay.Children.Add(_cursor);
-            Layer = new AnnotationLayer();
+            Layer = new AnnotationLayer { OnlyMine = true };
             Layer.Local += op => { if (_back != null) _back.Send(ScreenShareSession.Framed((byte)'A', op.ToBytes())); };
             _surface = new Grid();
             _surface.Children.Add(_image);
@@ -937,7 +963,13 @@ namespace Lazo
             if (_mode == ViewerMode.Draw && (granted & SharePermission.Draw) == 0) { SetMode(ViewerMode.Watch); Hint("Ya no puedes dibujar."); }
             if (_mode == ViewerMode.Control && (granted & SharePermission.Control) == 0) { SetMode(ViewerMode.Watch); Hint("Ya no controlas el equipo."); }
             // Al conceder lo que se pidió, se entra directamente en ese modo.
-            if ((gained & _asking & SharePermission.Control) != 0) { SetMode(ViewerMode.Control); Hint("Tienes el control. Pulsa el mismo botón para soltarlo."); }
+            if ((gained & _asking & SharePermission.Control) != 0)
+            {
+                SetMode(ViewerMode.Control);
+                Hint((granted & SharePermission.FullControl) != 0
+                    ? "Tienes el control total del equipo. Pulsa el mismo botón para soltarlo."
+                    : "Controlas la ventana activa. Pulsa el mismo botón para soltarlo.");
+            }
             else if ((gained & _asking & SharePermission.Draw) != 0) { SetMode(ViewerMode.Draw); Hint("Ya puedes dibujar."); }
             _asking = (byte)(_asking & ~gained);
             SyncButtons();
@@ -972,6 +1004,12 @@ namespace Lazo
         internal void Request(byte kind)
         {
             Ask(kind, "Pidiendo permiso…");
+        }
+
+        /// <summary>Para pruebas: lo mismo que pulsar el botón de control (pedirlo o soltarlo).</summary>
+        internal void ToggleControl()
+        {
+            OnControlClick();
         }
 
         internal byte Granted { get { return _granted; } }
@@ -1312,6 +1350,14 @@ namespace Lazo
         public void Update(string text)
         {
             _text.Text = text;
+        }
+
+        /// <summary>Mientras alguien controla el equipo, quien comparte no puede activar el dibujo.</summary>
+        public void SetDrawAllowed(bool allowed)
+        {
+            if (_drawButton == null) return;
+            _drawButton.IsEnabled = allowed;
+            _drawButton.ToolTip = allowed ? "Escribir sobre la pantalla (Esc para terminar)" : "Quita el control para poder dibujar";
         }
 
         /// <summary>Muestra «Quitar permisos» mientras alguien puede dibujar o controlar.</summary>

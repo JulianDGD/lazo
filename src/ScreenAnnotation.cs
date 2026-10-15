@@ -204,9 +204,15 @@ namespace Lazo
         private readonly HashSet<int> _mine = new HashSet<int>();
         private int _current;
         private bool _drawing;
+        // Los puntos del trazo en curso se agrupan y salen como mucho cada 16 ms: un solo paquete
+        // y un solo redibujado por fotograma, en lugar de uno por cada movimiento del mouse.
+        private readonly List<ushort> _batchX = new List<ushort>(), _batchY = new List<ushort>();
+        private readonly System.Windows.Threading.DispatcherTimer _batchTimer;
 
         public AnnotationTool Tool = AnnotationTool.Pen;
         public uint Color = Colors[0];
+        /// <summary>Visor: el borrador solo quita los trazos hechos en este equipo.</summary>
+        public bool OnlyMine;
 
         /// <summary>Cambio hecho aquí con el mouse; ya está aplicado en la capa.</summary>
         public event Action<AnnotationOp> Local;
@@ -220,7 +226,19 @@ namespace Lazo
             MouseLeftButtonDown += OnDown;
             MouseMove += OnMove;
             MouseLeftButtonUp += OnUp;
-            LostMouseCapture += (s, e) => _current = 0;
+            LostMouseCapture += (s, e) => { FlushBatch(); _current = 0; };
+            _batchTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+            _batchTimer.Tick += (s, e) => FlushBatch();
+        }
+
+        private void FlushBatch()
+        {
+            _batchTimer.Stop();
+            if (_batchX.Count == 0 || _current <= 0) { _batchX.Clear(); _batchY.Clear(); return; }
+            AnnotationOp op = new AnnotationOp { Kind = AnnotationOp.Points, Id = _current, Xs = _batchX.ToArray(), Ys = _batchY.ToArray() };
+            _batchX.Clear();
+            _batchY.Clear();
+            Emit(op);
         }
 
         public bool Drawing
@@ -236,8 +254,6 @@ namespace Lazo
                 if (!value && IsMouseCaptured) ReleaseMouseCapture();
             }
         }
-
-        public bool HasMine { get { return _mine.Count > 0; } }
 
         public void SetTool(AnnotationTool tool)
         {
@@ -412,17 +428,17 @@ namespace Lazo
             e.Handled = true;
             Point p = e.GetPosition(this);
             if (_current == -1) { EraseAt(p); return; }
-            Emit(new AnnotationOp
-            {
-                Kind = AnnotationOp.Points, Id = _current,
-                Xs = new[] { AnnotationOp.Norm(p.X / ActualWidth) }, Ys = new[] { AnnotationOp.Norm(p.Y / ActualHeight) }
-            });
+            _batchX.Add(AnnotationOp.Norm(p.X / ActualWidth));
+            _batchY.Add(AnnotationOp.Norm(p.Y / ActualHeight));
+            if (_batchX.Count >= AnnotationOp.MaxPoints) FlushBatch();
+            else if (!_batchTimer.IsEnabled) _batchTimer.Start();
         }
 
         private void OnUp(object sender, MouseButtonEventArgs e)
         {
             if (!_drawing) return;
             e.Handled = true;
+            FlushBatch();
             _current = 0;
             if (IsMouseCaptured) ReleaseMouseCapture();
         }
@@ -432,6 +448,7 @@ namespace Lazo
             double reach = 8 * Scale;
             foreach (AnnotationModel.Stroke stroke in _model.Strokes.Reverse().ToArray())
             {
+                if (OnlyMine && !_mine.Contains(stroke.Id)) continue;
                 if (!Hits(stroke, p, reach + StrokeWidth(stroke.Tool) / 2)) continue;
                 Emit(new AnnotationOp { Kind = AnnotationOp.Erase, Id = stroke.Id });
                 return;

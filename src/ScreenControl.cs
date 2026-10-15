@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -16,6 +17,8 @@ namespace Lazo
     {
         public const byte Draw = 1;
         public const byte Control = 2;
+        /// <summary>Junto con <see cref="Control"/>: control total del equipo. Sin él, solo la ventana activa.</summary>
+        public const byte FullControl = 4;
         /// <summary>Se suma al tipo de una petición para renunciar a ese permiso.</summary>
         public const byte Release = 0x80;
     }
@@ -23,11 +26,14 @@ namespace Lazo
     /// <summary>
     /// Envío de quien mira hacia quien comparte (peticiones, trazos, mouse y teclado) en su propio hilo,
     /// para que una red lenta no congele la ventana. Los paquetes salen en el orden en que se piden.
+    /// Nunca se descarta nada salvo movimientos del mouse repetidos: si la red va lenta, varios movimientos
+    /// seguidos se funden en el último, pero soltar una tecla o un botón siempre llega.
     /// </summary>
     internal sealed class ScreenBackChannel
     {
         private readonly Stream _stream;
-        private readonly System.Collections.Concurrent.BlockingCollection<byte[]> _queue = new System.Collections.Concurrent.BlockingCollection<byte[]>(4096);
+        private readonly LinkedList<byte[]> _queue = new LinkedList<byte[]>();
+        private bool _closed;
 
         public ScreenBackChannel(Stream stream)
         {
@@ -37,22 +43,44 @@ namespace Lazo
 
         public void Send(byte[] packet)
         {
-            try { _queue.TryAdd(packet); }
-            catch (InvalidOperationException) { }
+            lock (_queue)
+            {
+                if (_closed) return;
+                if (IsMove(packet) && _queue.Last != null && IsMove(_queue.Last.Value)) _queue.Last.Value = packet;
+                else _queue.AddLast(packet);
+                System.Threading.Monitor.Pulse(_queue);
+            }
+        }
+
+        private static bool IsMove(byte[] packet)
+        {
+            return packet.Length >= 2 && packet[0] == (byte)'I' && packet[1] == RemoteInputEvent.Move;
         }
 
         public void Close()
         {
-            try { _queue.CompleteAdding(); } catch (ObjectDisposedException) { }
+            lock (_queue)
+            {
+                _closed = true;
+                System.Threading.Monitor.Pulse(_queue);
+            }
         }
 
         private void Pump()
         {
             try
             {
-                foreach (byte[] packet in _queue.GetConsumingEnumerable())
+                while (true)
                 {
-                    _stream.Write(packet, 0, packet.Length);
+                    List<byte[]> batch = new List<byte[]>();
+                    lock (_queue)
+                    {
+                        while (_queue.Count == 0 && !_closed) System.Threading.Monitor.Wait(_queue);
+                        if (_queue.Count == 0 && _closed) return;
+                        batch.AddRange(_queue);
+                        _queue.Clear();
+                    }
+                    foreach (byte[] packet in batch) _stream.Write(packet, 0, packet.Length);
                     _stream.Flush();
                 }
             }
@@ -112,19 +140,107 @@ namespace Lazo
 
     /// <summary>
     /// Reproduce en este equipo el mouse y el teclado de quien tiene el control, limitado al área compartida.
+    /// <para><b>Ventana activa</b>: solo la aplicación compartida (o la que estaba al frente al conceder el control,
+    /// si se comparte una pantalla). Los clics que caerían en otra aplicación y las teclas con otra aplicación al
+    /// frente se descartan, y se bloquean las teclas Windows, Alt+Tab, Alt+Esc y Ctrl+Esc.</para>
+    /// <para><b>Control total del equipo</b>: mouse dentro de lo compartido y teclado sin restricciones.</para>
     /// Recuerda botones y teclas pulsados para soltarlos al quitar el control y no dejar nada atascado.
     /// Debe usarse desde un hilo en píxeles físicos (<see cref="Native.EnterPerMonitorDpi"/>).
     /// </summary>
     internal sealed class RemoteInputInjector
     {
+        /// <summary>Marca la entrada inyectada por Lazo; el atajo de teclado de Lazo la ignora.</summary>
+        public static readonly IntPtr Marker = new IntPtr(0x4C415A4F);
         private readonly ShareSource _source;
         private readonly object _lock = new object();
         private readonly HashSet<ushort> _keys = new HashSet<ushort>();
         private readonly HashSet<byte> _buttons = new HashSet<byte>();
+        private bool _full;
+        private IntPtr _target;
+        private uint _targetPid;
 
         public RemoteInputInjector(ShareSource source)
         {
             _source = source;
+        }
+
+        /// <summary>Modo del control recién concedido. En «ventana activa» fija la aplicación permitida.</summary>
+        public void Configure(bool full)
+        {
+            lock (_lock)
+            {
+                _full = full;
+                _target = full ? IntPtr.Zero : PickTarget();
+                _targetPid = 0;
+                if (_target != IntPtr.Zero) Native.GetWindowThreadProcessId(_target, out _targetPid);
+            }
+        }
+
+        /// <summary>Título de la ventana permitida en «ventana activa», para mostrarlo a quien comparte.</summary>
+        public string TargetTitle
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    if (_full || _target == IntPtr.Zero) return null;
+                    int length = Native.GetWindowTextLength(_target);
+                    System.Text.StringBuilder title = new System.Text.StringBuilder(length + 1);
+                    Native.GetWindowText(_target, title, title.Capacity);
+                    return title.ToString();
+                }
+            }
+        }
+
+        private IntPtr PickTarget()
+        {
+            if (_source.IsWindow) return _source.Handle;
+            uint self = (uint)Process.GetCurrentProcess().Id;
+            IntPtr front = Root(GetForegroundWindow());
+            if (Usable(front, self) && Intersects(front)) return front;
+            // Lo que está al frente puede ser el propio aviso de Lazo: se toma la primera ventana debajo.
+            for (IntPtr hwnd = GetTopWindow(IntPtr.Zero); hwnd != IntPtr.Zero; hwnd = Native.GetWindow(hwnd, 2))
+                if (Usable(hwnd, self) && Intersects(hwnd)) return hwnd;
+            return IntPtr.Zero;
+        }
+
+        private static bool Usable(IntPtr hwnd, uint self)
+        {
+            if (hwnd == IntPtr.Zero || !Native.IsWindowVisible(hwnd) || Native.IsIconic(hwnd)) return false;
+            if ((Native.GetWindowLong(hwnd, -20) & 0x80) != 0 || Native.GetWindowTextLength(hwnd) == 0) return false;
+            int cloaked;
+            if (Native.DwmGetWindowAttribute(hwnd, 14, out cloaked, 4) == 0 && cloaked != 0) return false;
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            return pid != self;
+        }
+
+        private bool Intersects(IntPtr hwnd)
+        {
+            Native.RECT r;
+            if (!Native.GetWindowRect(hwnd, out r)) return false;
+            return r.Right > _source.Left && r.Left < _source.Left + _source.Width && r.Bottom > _source.Top && r.Top < _source.Top + _source.Height;
+        }
+
+        private static IntPtr Root(IntPtr hwnd)
+        {
+            return hwnd == IntPtr.Zero ? IntPtr.Zero : GetAncestor(hwnd, 2);
+        }
+
+        private static uint ProcessOf(IntPtr hwnd)
+        {
+            uint pid = 0;
+            if (hwnd != IntPtr.Zero) Native.GetWindowThreadProcessId(hwnd, out pid);
+            return pid;
+        }
+
+        /// <summary>La aplicación permitida está al frente; si no, se intenta traer (la entrada inyectada lo permite).</summary>
+        private bool TargetInFront()
+        {
+            if (_targetPid == 0 || !Native.IsWindow(_target)) return false;
+            if (ProcessOf(GetForegroundWindow()) == _targetPid) return true;
+            SetForegroundWindow(_target);
+            return ProcessOf(GetForegroundWindow()) == _targetPid;
         }
 
         public void Apply(RemoteInputEvent input)
@@ -134,21 +250,32 @@ namespace Lazo
                 switch (input.Type)
                 {
                     case RemoteInputEvent.Move:
-                        MoveTo(input.X, input.Y, 0, 0);
+                        int mx, my;
+                        if (Point(input.X, input.Y, out mx, out my)) MoveTo(mx, my, 0, 0);
                         break;
                     case RemoteInputEvent.Down:
                     case RemoteInputEvent.Up:
                         uint flag = ButtonFlag(input.Button, input.Type == RemoteInputEvent.Down);
                         if (flag == 0) return;
-                        if (input.Type == RemoteInputEvent.Down) _buttons.Add(input.Button);
+                        int bx, by;
+                        if (!Point(input.X, input.Y, out bx, out by)) return;
+                        if (input.Type == RemoteInputEvent.Down)
+                        {
+                            if (!_full && (!Allowed(bx, by) || !TargetInFront())) return;
+                            _buttons.Add(input.Button);
+                        }
                         else if (!_buttons.Remove(input.Button)) return;
-                        MoveTo(input.X, input.Y, flag, 0);
+                        MoveTo(bx, by, flag, 0);
                         break;
                     case RemoteInputEvent.Wheel:
-                        MoveTo(input.X, input.Y, MouseWheel, input.Delta);
+                        int wx, wy;
+                        if (!Point(input.X, input.Y, out wx, out wy)) return;
+                        if (!_full && !Allowed(wx, wy)) return;
+                        MoveTo(wx, wy, MouseWheel, input.Delta);
                         break;
                     case RemoteInputEvent.KeyDown:
                         if (input.Key == 0 || input.Key > 0xFE) return;
+                        if (!_full && (Blocked(input.Key) || !TargetInFront())) return;
                         _keys.Add(input.Key);
                         Key(input.Key, false);
                         break;
@@ -158,6 +285,24 @@ namespace Lazo
                         break;
                 }
             }
+        }
+
+        /// <summary>El punto cae en la aplicación permitida (o en sus menús y diálogos).</summary>
+        private bool Allowed(int x, int y)
+        {
+            if (_targetPid == 0) return false;
+            return ProcessOf(Root(WindowFromPoint(new POINT { X = x, Y = y }))) == _targetPid;
+        }
+
+        /// <summary>Combinaciones que sacarían el control de la ventana activa.</summary>
+        private bool Blocked(ushort vk)
+        {
+            if (vk == 0x5B || vk == 0x5C) return true;
+            bool alt = _keys.Contains(0x12) || _keys.Contains(0xA4) || _keys.Contains(0xA5);
+            bool ctrl = _keys.Contains(0x11) || _keys.Contains(0xA2) || _keys.Contains(0xA3);
+            if (vk == 0x09 && alt) return true;
+            if (vk == 0x1B && (alt || ctrl)) return true;
+            return false;
         }
 
         /// <summary>Suelta todo lo que quien controlaba dejó pulsado.</summary>
@@ -176,13 +321,20 @@ namespace Lazo
             }
         }
 
-        private void MoveTo(ushort nx, ushort ny, uint extra, int data)
+        /// <summary>Punto físico dentro de lo compartido.</summary>
+        private bool Point(ushort nx, ushort ny, out int x, out int y)
         {
             Native.RECT area;
-            if (!Area(out area)) return;
+            x = y = 0;
+            if (!Area(out area)) return false;
             int width = Math.Max(1, area.Right - area.Left), height = Math.Max(1, area.Bottom - area.Top);
-            double x = area.Left + nx / 65535.0 * (width - 1);
-            double y = area.Top + ny / 65535.0 * (height - 1);
+            x = (int)Math.Round(area.Left + nx / 65535.0 * (width - 1));
+            y = (int)Math.Round(area.Top + ny / 65535.0 * (height - 1));
+            return true;
+        }
+
+        private void MoveTo(int x, int y, uint extra, int data)
+        {
             int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
             int vw = Math.Max(2, GetSystemMetrics(78)), vh = Math.Max(2, GetSystemMetrics(79));
             int ax = (int)Math.Round((x - vx) * 65535.0 / (vw - 1));
@@ -248,10 +400,10 @@ namespace Lazo
             SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT)));
         }
 
-        /// <summary>Marca la entrada inyectada por Lazo, por si alguna ventana necesita distinguirla.</summary>
-        private static readonly IntPtr Marker = new IntPtr(0x4C415A4F);
         private const uint MouseMove = 0x0001, MouseWheel = 0x0800, MouseVirtualDesk = 0x4000, MouseAbsolute = 0x8000;
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT { public int X; public int Y; }
         [StructLayout(LayoutKind.Sequential)]
         private struct MOUSEINPUT { public int dx; public int dy; public int mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
         [StructLayout(LayoutKind.Sequential)]
@@ -264,7 +416,13 @@ namespace Lazo
         [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
         [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint code, uint type);
+        [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] private static extern IntPtr GetTopWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(POINT point);
     }
+
 
     /// <summary>
     /// Capa transparente sobre lo que se comparte, donde quien comparte dibuja y ve lo que dibujan los demás.
@@ -281,6 +439,7 @@ namespace Lazo
 
         public AnnotationLayer Layer { get; private set; }
         public event Action DrawingEnded;
+        public event Action<bool> DrawingChanged;
 
         public ScreenOverlayWindow(ShareSource source)
         {
@@ -320,6 +479,8 @@ namespace Lazo
             if (Layer.Drawing == on) return;
             Layer.Drawing = on;
             SetClickThrough(!on);
+            Action<bool> changed = DrawingChanged;
+            if (changed != null) changed(on);
             if (on) { Activate(); Focus(); }
             else
             {
@@ -387,18 +548,23 @@ namespace Lazo
         [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
     }
 
-    /// <summary>Aviso abajo a la derecha: alguien que mira pide dibujar o controlar. No aparece en la transmisión.</summary>
+    /// <summary>
+    /// Aviso abajo a la derecha: alguien que mira pide dibujar o controlar. No aparece en la transmisión.
+    /// Para el control se elige el modo: «Ventana activa» o «Control total del equipo».
+    /// </summary>
     internal sealed class PermissionPromptWindow : Window
     {
-        private readonly Action<bool> _respond;
+        private readonly Action<bool, bool> _respond;
         private bool _answered;
+        public readonly int ViewerId;
 
-        public PermissionPromptWindow(string viewer, byte kind, int stack, Action<bool> respond)
+        public PermissionPromptWindow(int viewerId, string viewer, byte kind, int stack, Action<bool, bool> respond)
         {
+            ViewerId = viewerId;
             _respond = respond;
             bool control = kind == SharePermission.Control;
             Title = "Lazo · permiso";
-            Width = 380;
+            Width = control ? 430 : 380;
             SizeToContent = SizeToContent.Height;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
@@ -424,19 +590,34 @@ namespace Lazo
             StackPanel words = new StackPanel { Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
             words.Children.Add(Theme.Text(viewer + (control ? " quiere controlar tu equipo" : " quiere dibujar en tu pantalla"), 13, Theme.Ink, FontWeights.SemiBold));
             words.Children.Add(Theme.Text(control
-                ? "Podrá mover el mouse, hacer clic y escribir dentro de lo que compartes. Quítale el control cuando quieras desde la barra superior."
+                ? "Ventana activa: solo la ventana que compartes (o la que tienes al frente). Control total: mouse y teclado en todo el equipo, incluidas las teclas de Windows. Quítalo cuando quieras desde la barra superior."
                 : "Sus trazos aparecerán sobre tu pantalla y los verán todos los que miran.", 11.5, Theme.Muted));
             Grid.SetColumn(words, 1);
             head.Children.Add(words);
             body.Children.Add(head);
             StackPanel buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 14, 0, 0) };
             Button deny = Theme.Button("Rechazar", false);
-            deny.Click += (s, e) => Answer(false);
-            Button allow = Theme.Button("Permitir", true);
-            allow.Margin = new Thickness(8, 0, 0, 0);
-            allow.Click += (s, e) => Answer(true);
+            deny.Click += (s, e) => Answer(false, false);
             buttons.Children.Add(deny);
-            buttons.Children.Add(allow);
+            if (control)
+            {
+                Button full = Theme.Button("Control total", false);
+                full.Margin = new Thickness(8, 0, 0, 0);
+                full.ToolTip = "Control total del equipo";
+                full.Click += (s, e) => Answer(true, true);
+                buttons.Children.Add(full);
+                Button active = Theme.Button("Ventana activa", true);
+                active.Margin = new Thickness(8, 0, 0, 0);
+                active.Click += (s, e) => Answer(true, false);
+                buttons.Children.Add(active);
+            }
+            else
+            {
+                Button allow = Theme.Button("Permitir", true);
+                allow.Margin = new Thickness(8, 0, 0, 0);
+                allow.Click += (s, e) => Answer(true, false);
+                buttons.Children.Add(allow);
+            }
             body.Children.Add(buttons);
             Content = new Border
             {
@@ -449,27 +630,33 @@ namespace Lazo
                 Child = body
             };
             DispatcherTimer timeout = new DispatcherTimer { Interval = TimeSpan.FromSeconds(60) };
-            timeout.Tick += (s, e) => { timeout.Stop(); Answer(false); };
+            timeout.Tick += (s, e) => { timeout.Stop(); Answer(false, false); };
             timeout.Start();
             SourceInitialized += (s, e) =>
             {
                 try { Native.SetWindowDisplayAffinity(new WindowInteropHelper(this).Handle, 0x11); } catch { }
             };
             Loaded += (s, e) => WindowPlacement.PlaceBottomRight(this, stack);
-            Closed += (s, e) => { timeout.Stop(); Answer(false); };
-            KeyDown += (s, e) => { if (e.Key == Key.Escape) Answer(false); };
+            Closed += (s, e) => { timeout.Stop(); Answer(false, false); };
+            KeyDown += (s, e) => { if (e.Key == Key.Escape) Answer(false, false); };
+        }
+
+        /// <summary>Vuelve a colocarse cuando se cierra otro aviso de la pila.</summary>
+        public void Restack(int stack)
+        {
+            if (IsLoaded) WindowPlacement.PlaceBottomRight(this, stack);
         }
 
         public void Dismiss()
         {
-            Answer(false);
+            Answer(false, false);
         }
 
-        private void Answer(bool accept)
+        private void Answer(bool accept, bool full)
         {
             if (_answered) return;
             _answered = true;
-            _respond(accept);
+            _respond(accept, full);
             if (IsVisible) Close();
         }
     }

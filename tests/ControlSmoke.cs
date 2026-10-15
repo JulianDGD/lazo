@@ -66,9 +66,12 @@ internal static class ControlSmoke
 
         bool ok = true;
         int port = FreePort();
-        using (NetworkEngine viewerSide = new NetworkEngine(Path.Combine(output, "inbox"), FreeUdp(), port))
-        using (NetworkEngine sharer = new NetworkEngine(Path.Combine(output, "inbox2"), FreeUdp(), FreePort()))
+        using (NetworkEngine viewerSide = new NetworkEngine(Path.Combine(output, "inbox"), FreeUdp(), port, Path.Combine(output, "perfil-visor")))
+        using (NetworkEngine sharer = new NetworkEngine(Path.Combine(output, "inbox2"), FreeUdp(), FreePort(), Path.Combine(output, "perfil-emisor")))
         {
+            // Los dos confirman el código de emparejamiento automáticamente.
+            viewerSide.PairingPrompt += request => Task.FromResult(true);
+            sharer.PairingPrompt += request => Task.FromResult(true);
             ScreenViewerWindow window = null;
             viewerSide.ScreenOffered += invite =>
             {
@@ -91,10 +94,11 @@ internal static class ControlSmoke
             int fromViewer = 0;
             session.Annotated += op => Application.Current.Dispatcher.BeginInvoke((Action)(() => { fromViewer++; hostLayer.Apply(op); }));
             byte asked = 0;
-            session.PermissionRequested += (id, name, kind) => { asked |= kind; session.Answer(id, kind, true); };
+            bool fullNext = false;
+            session.PermissionRequested += (id, name, kind) => { asked |= kind; session.Answer(id, kind, true, kind == SharePermission.Control && fullNext); };
             bool ended = false;
             session.Ended += () => ended = true;
-            session.Invite(new Peer { Id = Guid.NewGuid(), Name = "Visor", Address = local, Port = port });
+            session.Invite(new Peer { Id = viewerSide.SelfId, Name = "Visor", Address = local, Port = port });
             session.Start();
 
             ok &= Check(await Until(() => window != null && window.CanAsk, 5000), "el visor nuevo y quien comparte se saludan");
@@ -110,12 +114,26 @@ internal static class ControlSmoke
             window.Layer.Commit(Stroke(22, AnnotationTool.Pen, 0.2, 0.2, 0.3, 0.4));
             ok &= Check(await Until(() => fromViewer == 1 && hostLayer.Children.Count == 2, 3000), "el trazo del visor llega a quien comparte");
 
+            // El visor no puede borrar ni alargar un trazo de quien comparte (id 11).
+            window.Layer.Commit(new AnnotationOp { Kind = AnnotationOp.Erase, Id = 11 });
+            await Task.Delay(500);
+            ok &= Check(hostLayer.Children.Count == 2 && fromViewer == 1, "el visor no puede borrar trazos ajenos");
+
             window.Layer.EraseMine();
             ok &= Check(await Until(() => hostLayer.Children.Count == 1, 3000), "borrar los trazos propios se refleja en quien comparte");
 
             window.Request(SharePermission.Control);
-            ok &= Check(await Until(() => (window.Granted & SharePermission.Control) != 0 && session.Controller == "Visor", 3000),
-                "pedir control se concede y quien comparte sabe quién controla");
+            ok &= Check(await Until(() => (window.Granted & SharePermission.Control) != 0 && session.Controller == "Visor (ventana activa)", 3000)
+                && (window.Granted & SharePermission.FullControl) == 0,
+                "pedir control concede «Ventana activa» y quien comparte sabe quién controla");
+
+            // Soltar el control y pedirlo de nuevo, ahora con control total.
+            window.ToggleControl();
+            ok &= Check(await Until(() => (window.Granted & SharePermission.Control) == 0 && session.Controller == null, 3000), "soltar el control lo devuelve");
+            fullNext = true;
+            window.Request(SharePermission.Control);
+            ok &= Check(await Until(() => (window.Granted & SharePermission.FullControl) != 0 && session.Controller == "Visor (control total)", 3000),
+                "el control total del equipo llega como permiso propio");
 
             session.RevokeAll();
             ok &= Check(await Until(() => window.Granted == 0 && session.Controller == null && !session.AnyGranted, 3000), "quitar permisos llega al visor");
@@ -128,7 +146,6 @@ internal static class ControlSmoke
             hostLayer.Commit(new AnnotationOp { Kind = AnnotationOp.Clear });
             ok &= Check(await Until(() => window.Layer.Children.Count == 0, 3000), "borrar todo llega al visor");
 
-            ok &= await OldViewer(session, hostLayer, local);
 
             session.Stop();
             ok &= Check(await Until(() => ended, 4000), "la transmisión termina");
@@ -137,58 +154,6 @@ internal static class ControlSmoke
         shared.Close();
         Console.WriteLine(ok ? "OK: canal de retorno de la pantalla compartida" : "FALLO en el canal de retorno");
         return ok;
-    }
-
-    /// <summary>Visor de una versión anterior: no saluda y rechaza cualquier paquete que no sea S, F, K o E.</summary>
-    private static async Task<bool> OldViewer(ScreenShareSession session, AnnotationLayer hostLayer, IPAddress local)
-    {
-        TcpListener listener = new TcpListener(local, 0);
-        listener.Start();
-        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        session.Invite(new Peer { Id = Guid.NewGuid(), Name = "Antiguo", Address = local, Port = port });
-        bool clean = true;
-        int frames = 0;
-        using (TcpClient client = await listener.AcceptTcpClientAsync())
-        {
-            listener.Stop();
-            client.ReceiveTimeout = 5000;
-            NetworkStream stream = client.GetStream();
-            BinaryReader reader = new BinaryReader(stream, Encoding.UTF8, true);
-            string magic = Encoding.ASCII.GetString(reader.ReadBytes(5));
-            for (int i = 0; i < 3; i++) reader.ReadBytes(reader.ReadUInt16());
-            stream.WriteByte(1);
-            Task reading = Task.Run(() =>
-            {
-                try
-                {
-                    DateTime until = DateTime.UtcNow.AddSeconds(2);
-                    while (DateTime.UtcNow < until)
-                    {
-                        byte type = reader.ReadByte();
-                        if (type == (byte)'K') continue;
-                        if (type == (byte)'E') break;
-                        if (type == (byte)'S') { reader.ReadInt32(); reader.ReadInt32(); continue; }
-                        if (type != (byte)'F') { clean = false; break; }
-                        reader.ReadInt32(); reader.ReadInt32();
-                        int count = reader.ReadInt32();
-                        for (int i = 0; i < count; i++)
-                        {
-                            reader.ReadBytes(8);
-                            reader.ReadBytes(reader.ReadInt32());
-                        }
-                        frames++;
-                    }
-                }
-                catch (IOException) { }
-            });
-            // Un trazo mientras mira: al visor antiguo no debe llegarle.
-            await Task.Delay(400);
-            hostLayer.Commit(Stroke(44, AnnotationTool.Pen, 0.4, 0.4, 0.6, 0.6));
-            await reading;
-            bool ok = Check(magic == "LAZOS", "un visor antiguo recibe la invitación de siempre");
-            ok &= Check(clean && frames > 0, "un visor antiguo solo recibe fotogramas conocidos (" + frames + ")");
-            return ok;
-        }
     }
 
     private static AnnotationOp Stroke(int id, AnnotationTool tool, double x0, double y0, double x1, double y1)
