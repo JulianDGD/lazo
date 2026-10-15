@@ -3076,6 +3076,8 @@ namespace Lazo
         private ShareSource _shareSource;
         private readonly HashSet<Guid> _shareTargets = new HashSet<Guid>();
         private ShareBarWindow _shareBar;
+        private ScreenOverlayWindow _shareOverlay;
+        private readonly List<PermissionPromptWindow> _sharePrompts = new List<PermissionPromptWindow>();
 
         private Border ShareCard()
         {
@@ -3371,11 +3373,18 @@ namespace Lazo
             session.Notice += text => Dispatcher.BeginInvoke((Action)(() => ShowToast(text)));
             session.Changed += () => Dispatcher.BeginInvoke((Action)(() => { if (_share == session) UpdateShareStatus(); }));
             session.Ended += () => Dispatcher.BeginInvoke((Action)(() => OnShareEnded(session)));
+            // Trazos y permisos: la capa de dibujo va antes que la barra para que la barra quede encima.
+            ScreenOverlayWindow overlay = new ScreenOverlayWindow(_shareSource);
+            overlay.Layer.Local += op => session.Annotate(op);
+            session.Annotated += op => Dispatcher.BeginInvoke((Action)(() => { if (_shareOverlay == overlay) overlay.Layer.Apply(op); }));
+            session.PermissionRequested += (viewerId, name, kind) => Dispatcher.BeginInvoke((Action)(() => AskSharePermission(session, viewerId, name, kind)));
+            _shareOverlay = overlay;
             _share = session;
             _shareInvited.Clear();
             foreach (Peer peer in targets) { session.Invite(peer); _shareInvited.Add(peer.Id); }
             session.Start();
-            _shareBar = new ShareBarWindow(StopShare);
+            overlay.Show();
+            _shareBar = new ShareBarWindow(StopShare, overlay, session.RevokeAll);
             _shareBar.Show();
             UpdateShareStatus();
             RefreshShareCard();
@@ -3495,7 +3504,9 @@ namespace Lazo
             string text = "Compartiendo " + _share.Source.Label;
             if (text.Length > 46) text = text.Substring(0, 45) + "…";
             text += names.Length == 0 ? " · esperando…" : " · " + (names.Length == 1 ? names[0] : names.Length + " personas") + " · " + Math.Round(_share.Fps) + " fps";
-            if (_shareBar != null) _shareBar.Update(text);
+            string controller = _share.Controller;
+            if (controller != null) text += " · " + controller + " controla";
+            if (_shareBar != null) { _shareBar.Update(text); _shareBar.SetGranted(_share.AnyGranted); }
             if (_shareOpen) RefreshShareCard();
         }
 
@@ -3509,10 +3520,28 @@ namespace Lazo
             if (_share != session) return;
             _share = null;
             if (_shareBar != null) { _shareBar.Close(); _shareBar = null; }
+            if (_shareOverlay != null) { _shareOverlay.Close(); _shareOverlay = null; }
+            foreach (PermissionPromptWindow prompt in _sharePrompts.ToArray()) prompt.Dismiss();
+            _sharePrompts.Clear();
             _shareInvited.Clear();
             RefreshShareCard();
             if (_chatPanel != null) _chatPanel.RefreshOpen();
             ShowToast("Dejaste de compartir la pantalla");
+        }
+
+        /// <summary>Alguien que mira pide dibujar o controlar: decide quien comparte.</summary>
+        private void AskSharePermission(ScreenShareSession session, int viewerId, string name, byte kind)
+        {
+            if (_share != session) { session.Answer(viewerId, kind, false); return; }
+            PermissionPromptWindow prompt = null;
+            prompt = new PermissionPromptWindow(name, kind, _sharePrompts.Count, accept =>
+            {
+                _sharePrompts.Remove(prompt);
+                session.Answer(viewerId, kind, accept);
+                if (accept) ShowToast(kind == SharePermission.Control ? name + " puede controlar tu equipo" : name + " puede dibujar en tu pantalla");
+            });
+            _sharePrompts.Add(prompt);
+            prompt.Show();
         }
 
         private Task<IScreenSink> OnScreenOffered(ScreenInvite invite)
