@@ -237,9 +237,14 @@ namespace Lazo
         public string Fingerprint;
         public string Name;
         public DateTime Since;
+        /// <summary>Las dos personas confirmaron el código de 6 cifras.</summary>
+        public bool Verified;
     }
 
-    /// <summary>Equipos emparejados: identificador → huella de su clave. Solo se guardan tras confirmar el código.</summary>
+    /// <summary>
+    /// Equipos conocidos: identificador → huella de su clave. Se guardan al primer contacto (como SSH)
+    /// y quedan verificados si las dos personas confirman el código de 6 cifras.
+    /// </summary>
     internal sealed class PairingStore
     {
         private readonly string _path;
@@ -260,7 +265,7 @@ namespace Lazo
                     DateTime since;
                     if (parts.Length < 4 || parts[1].Length != 64) continue;
                     DateTime.TryParse(parts[3], out since);
-                    _devices[parts[0]] = new PairedDevice { Id = parts[0], Fingerprint = parts[1], Name = parts[2], Since = since };
+                    _devices[parts[0]] = new PairedDevice { Id = parts[0], Fingerprint = parts[1], Name = parts[2], Since = since, Verified = parts.Length > 4 && parts[4] == "v" };
                 }
             }
             catch { }
@@ -290,6 +295,19 @@ namespace Lazo
             Raise();
         }
 
+        public void MarkVerified(string id, string name)
+        {
+            lock (_lock)
+            {
+                PairedDevice device;
+                if (!_devices.TryGetValue(id, out device)) return;
+                device.Verified = true;
+                if (!string.IsNullOrWhiteSpace(name)) device.Name = Clean(name);
+                Save();
+            }
+            Raise();
+        }
+
         public void Remove(string id)
         {
             lock (_lock)
@@ -311,7 +329,7 @@ namespace Lazo
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(_path));
-                File.WriteAllLines(_path, _devices.Values.Select(d => d.Id + "|" + d.Fingerprint + "|" + Clean(d.Name) + "|" + d.Since.ToString("yyyy-MM-dd")));
+                File.WriteAllLines(_path, _devices.Values.Select(d => d.Id + "|" + d.Fingerprint + "|" + Clean(d.Name) + "|" + d.Since.ToString("yyyy-MM-dd") + "|" + (d.Verified ? "v" : "")));
             }
             catch { }
         }

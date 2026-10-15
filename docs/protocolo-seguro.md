@@ -11,7 +11,7 @@ Todos los enteros van en *little endian*, salvo donde se indique. `texto` es `u1
   - macOS: Llavero del usuario, servicio `com.lazo.identity`.
 - Clave pública: 64 bytes `X || Y` (big endian, sin el prefijo `0x04`).
 - Huella: SHA‑256 de la clave pública, en hexadecimal minúscula.
-- Equipos emparejados: identificador → huella y nombre, en `paired.txt` (Windows, `%AppData%\Lazo`) o `paired.json` (macOS, `~/Library/Application Support/Lazo`). Solo se emparejan dos equipos cuando las dos personas confirman el mismo código.
+- Equipos conocidos: identificador → huella, nombre y si está verificado, en `paired.txt` (Windows, `%AppData%\Lazo`) o `paired.json` (macOS, `~/Library/Application Support/Lazo`). Se guardan solos en el primer contacto (confianza en el primer uso, como SSH). Verificar con el código de 6 cifras es opcional.
 
 ## Descubrimiento (UDP 48351, difusión)
 
@@ -20,7 +20,7 @@ LAZO3|<id>|<nombre>|<puerto TCP>|<huella>
 LAZO3A|<id>|<foto JPEG en base64, ≤ 12 000 bytes>
 ```
 
-Cada 2,5 s por cada dirección de difusión privada. Se descarta todo lo que no venga de la subred IPv4 privada local. El anuncio no está firmado: solo sirve para listar equipos. La identidad se comprueba al conectar. Si la huella anunciada de un equipo emparejado no coincide con la guardada, se muestra como **identidad cambiada** y no se le puede enviar nada.
+Cada 2,5 s por cada dirección de difusión privada. Se descarta todo lo que no venga de la subred IPv4 privada local. El anuncio no está firmado: solo sirve para listar equipos. La identidad se comprueba al conectar. Si la huella anunciada de un equipo conocido no coincide con la guardada, se muestra como **identidad cambiada** y no se le puede enviar nada.
 
 ## Conexión (TCP 48352)
 
@@ -51,31 +51,30 @@ cifrado AES‑256‑CBC con relleno PKCS#7 (texto ≤ 65 536 bytes)
 
 La secuencia empieza en 0 en cada sentido y sube en 1 por registro. Se comprueba la etiqueta (comparación en tiempo constante) antes de descifrar; cualquier error cierra la conexión.
 
-### Estado de emparejamiento
+### Identidad conocida
 
 Primer registro, servidor → cliente: `u8` estado.
 
-- `1`: el servidor tiene emparejado al cliente con esa misma clave.
-- `0`: no lo tiene emparejado. Solo se acepta la operación `P`.
+- `1`: identidad aceptada. Si el servidor no conocía al cliente, acaba de guardar su clave.
 - `2`: el servidor tiene ese identificador con otra clave. Cierra.
 
-El cliente aplica la misma regla a la clave del servidor. Si cualquiera de los dos no está emparejado, el cliente envía `P` antes de la operación.
+El cliente aplica la misma regla: si no conocía al servidor, guarda su clave; si la conocía y es otra, cierra sin enviar nada. Ninguna operación pide código.
 
 ## Operaciones (cliente → servidor, dentro del canal)
 
 | Byte | Operación | Cuerpo | Respuesta |
 |---|---|---|---|
-| `P` | Emparejar | `texto` nombre (≤ 80) | Ver abajo |
+| `P` | Verificar (opcional) | `texto` nombre (≤ 80) | Ver abajo; la conexión termina después |
 | `F` | Archivo | `texto` nombre de quien envía (≤ 80) · `texto` nombre del archivo (≤ 255) · `i64` tamaño · `i32` previo · previo JPEG (≤ 48 000) | `u8` 1 acepta / 0 rechaza; si acepta: contenido, SHA‑256 (32), `u8` 1 guardado |
 | `C` | Chat | `texto` nombre · `texto` mensaje (≤ 4 000 bytes, ≤ 2 000 caracteres) | `u8` 1 |
 | `D` | Señal | `texto` nombre · `u8` tipo (2 escribiendo, 3 presencia, 4 zumbido) · `texto` cuerpo | `u8` 1 |
 | `S` | Pantalla | `texto` nombre · `texto` origen (≤ 400) | `u8` 1 acepta / 0; si acepta, sigue el flujo de pantalla |
 
-Una conexión lleva una sola operación, precedida si hace falta de `P`.
+Una conexión lleva una sola operación.
 
-### Emparejar (`P`)
+### Verificar (`P`, opcional)
 
-Los dos lados calculan el código `SAS = (u32 big endian de SHA256("LAZO3 SAS" || th2)[0..4]) mod 1 000 000`, con 6 cifras. Cada persona ve el mismo código y elige **Coincide** o **Cancelar** en un máximo de 90 s. Cada lado envía su decisión (`u8` 1/0) en cuanto la tiene y lee la del otro. Solo si las dos son 1 se guarda el emparejamiento en los dos equipos. El servidor rechaza (`0`) si ya hay una petición abierta de ese identificador o más de 3 en 5 minutos.
+Los dos lados calculan el código `SAS = (u32 big endian de SHA256("LAZO3 SAS" || th2)[0..4]) mod 1 000 000`, con 6 cifras. Cada persona ve el mismo código y elige **Coincide** o **Cancelar** en un máximo de 90 s. Cada lado envía su decisión (`u8` 1/0) en cuanto la tiene y lee la del otro. Solo si las dos son 1 el equipo queda marcado como **verificado** en los dos lados. Sirve para descartar que alguien se interpusiera en la red durante el primer contacto. El servidor rechaza (`0`) si ya hay una petición abierta de ese identificador o más de 3 en 5 minutos.
 
 ## Pantalla compartida
 

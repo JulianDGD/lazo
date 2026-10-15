@@ -1358,48 +1358,66 @@ namespace Lazo
             }, 290);
         }
 
-        /// <summary>Equipos emparejados y huella propia. Olvidar uno obliga a confirmar el código de nuevo.</summary>
+        /// <summary>
+        /// Equipos conocidos y huella propia. Lazo recuerda la clave de cada equipo al primer contacto;
+        /// verificar con el código es opcional y olvidar uno hace que se vuelva a recordar en el siguiente contacto.
+        /// </summary>
         private void AddPairedDevices(StackPanel panel)
         {
-            TextBlock label = Theme.Label("Equipos emparejados");
+            TextBlock label = Theme.Label("Equipos conocidos");
             label.Margin = new Thickness(0, 16, 0, 0);
             panel.Children.Add(label);
+            TextBlock help = Theme.Text("Lazo recuerda cada equipo la primera vez que se conectan y avisa si su identidad cambia. Verificar el código con la otra persona es opcional.", 11, Theme.Muted);
+            help.TextWrapping = TextWrapping.Wrap;
+            panel.Children.Add(help);
             TextBlock own = Theme.Text("Huella de este equipo: " + LazoCrypto.ShortFingerprint(_network.SelfFingerprint), 11, Theme.Muted);
             own.Margin = new Thickness(0, 2, 0, 4);
             panel.Children.Add(own);
-            List<PairedDevice> devices = _network.Pairings.All();
-            if (devices.Count == 0)
-            {
-                TextBlock none = Theme.Text("Ninguno todavía. Al enviar algo a alguien por primera vez, los dos confirman un código de 6 cifras.", 11, Theme.Muted);
-                none.TextWrapping = TextWrapping.Wrap;
-                panel.Children.Add(none);
-                return;
-            }
-            foreach (PairedDevice device in devices)
+            foreach (PairedDevice device in _network.Pairings.All())
             {
                 Grid row = new Grid { Margin = new Thickness(0, 4, 0, 0) };
                 row.ColumnDefinitions.Add(new ColumnDefinition());
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 StackPanel words = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-                TextBlock name = Theme.Text(device.Name, 12, Theme.Ink, FontWeights.SemiBold);
+                TextBlock name = Theme.Text(device.Name + (device.Verified ? "  ✓" : ""), 12, Theme.Ink, FontWeights.SemiBold);
                 name.TextTrimming = TextTrimming.CharacterEllipsis;
+                name.ToolTip = device.Verified ? "Verificado con código" : "Conocido, sin verificar";
                 words.Children.Add(name);
                 words.Children.Add(Theme.Text(LazoCrypto.ShortFingerprint(device.Fingerprint), 10.5, Theme.Muted));
                 row.Children.Add(words);
+                StackPanel actions = new StackPanel { Orientation = Orientation.Horizontal };
+                string id = device.Id;
+                string deviceName = device.Name;
+                Peer online = _peers.FirstOrDefault(p => p.Id.ToString("D") == id && p.Paired);
+                if (!device.Verified && online != null)
+                {
+                    Button verify = Theme.Button("Verificar", false);
+                    verify.MinHeight = 28;
+                    verify.ToolTip = "Comparar un código de 6 cifras con la otra persona";
+                    verify.Click += async (s, e) =>
+                    {
+                        verify.IsEnabled = false;
+                        try { ShowToast(await _network.VerifyAsync(online) ? deviceName + " quedó verificado" : "No se verificó"); }
+                        catch (Exception ex) { ShowToast(ex.Message); }
+                        verify.IsEnabled = true;
+                    };
+                    actions.Children.Add(verify);
+                }
                 Button forget = Theme.Button("Olvidar", false);
                 forget.MinHeight = 28;
-                forget.ToolTip = "Habrá que volver a confirmar el código para enviarle algo";
-                string id = device.Id;
+                forget.Margin = new Thickness(6, 0, 0, 0);
+                forget.ToolTip = "Úsalo si reinstaló Lazo: su nueva identidad se recordará en el siguiente contacto";
                 forget.Click += (s, e) => { _network.Pairings.Remove(id); panel.Children.Remove(row); };
-                Grid.SetColumn(forget, 1);
-                row.Children.Add(forget);
+                actions.Children.Add(forget);
+                Grid.SetColumn(actions, 1);
+                row.Children.Add(actions);
                 panel.Children.Add(row);
             }
         }
 
         private readonly List<PairingWindow> _pairings = new List<PairingWindow>();
 
-        /// <summary>Muestra el código de emparejamiento y devuelve si la persona confirma que coincide.</summary>
+        /// <summary>Muestra el código de verificación y devuelve si la persona confirma que coincide.</summary>
         private Task<bool> OnPairingPrompt(PairingRequest request)
         {
             TaskCompletionSource<bool> result = new TaskCompletionSource<bool>();

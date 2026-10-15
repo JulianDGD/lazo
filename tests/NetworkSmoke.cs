@@ -86,33 +86,32 @@ internal static class NetworkSmoke
 
             Peer target = new Peer { Id = receiver.SelfId, Name = "Receptor", Address = local, Port = receiverPort, Fingerprint = receiver.SelfFingerprint };
 
-            // Sin emparejar y con el código rechazado, no se envía nada.
+            // Primer contacto: se recuerdan las claves sin pedir ningún código.
             int prompts = 0;
             bool acceptCode = false;
             string codeSeenBySender = null, codeSeenByReceiver = null;
             sender.PairingPrompt += request => { prompts++; codeSeenBySender = request.Code; return Task.FromResult(acceptCode); };
             receiver.PairingPrompt += request => { codeSeenByReceiver = request.Code; return Task.FromResult(true); };
-            bool refused = false;
-            try { await sender.SendAsync(target, input, null); }
-            catch (PairingRequiredException) { refused = true; }
-            Check(refused && !File.Exists(Path.Combine(directory, "recibidos", "origen.bin")), "sin confirmar el código no se envía nada");
-
-            // Emparejar: los dos ven el mismo código.
-            acceptCode = true;
             await sender.SendAsync(target, input, null);
-            await Expect(finished.Task, 15000, "transferencia tras emparejar");
+            await Expect(finished.Task, 15000, "transferencia al primer contacto");
             if (finished.Task.Result.StartsWith("Error:")) throw new Exception(finished.Task.Result);
-            Check(codeSeenBySender != null && codeSeenBySender == codeSeenByReceiver && codeSeenBySender.Length == 6, "los dos equipos muestran el mismo código (" + codeSeenBySender + ")");
-            Check(receiver.Pairings.Get(sender.SelfId.ToString("D")) != null && sender.Pairings.Get(receiver.SelfId.ToString("D")) != null, "los dos guardan el emparejamiento");
+            Check(prompts == 0, "no se pide ningún código para enviar");
+            Check(receiver.Pairings.Get(sender.SelfId.ToString("D")) != null && sender.Pairings.Get(receiver.SelfId.ToString("D")) != null, "los dos recuerdan la clave del otro");
             Check(offerPeer == sender.SelfId, "la oferta llega con la identidad comprobada de quien envía");
             string received = Path.Combine(directory, "recibidos", "origen.bin");
             Check(receivedPath == received && File.ReadAllBytes(received).SequenceEqual(data), "archivo cifrado recibido íntegro (" + data.Length + " bytes)");
 
-            // Ya emparejados: no se vuelve a pedir el código.
-            int before = prompts;
             await sender.SendChatAsync(target, "hola por canal cifrado");
             await Task.Delay(300);
-            Check(prompts == before && chat == "hola por canal cifrado" && chatFrom == sender.SelfId, "chat sin volver a pedir el código y con la identidad real");
+            Check(chat == "hola por canal cifrado" && chatFrom == sender.SelfId, "chat con la identidad real");
+
+            // Verificación opcional: si alguien cancela no queda verificado; si los dos confirman, sí.
+            Check(!await sender.VerifyAsync(target) && !sender.Pairings.Get(receiver.SelfId.ToString("D")).Verified, "verificación cancelada no marca nada");
+            acceptCode = true;
+            Check(await sender.VerifyAsync(target), "verificación confirmada por los dos");
+            Check(codeSeenBySender != null && codeSeenBySender == codeSeenByReceiver && codeSeenBySender.Length == 6, "los dos equipos muestran el mismo código (" + codeSeenBySender + ")");
+            await Task.Delay(200);
+            Check(sender.Pairings.Get(receiver.SelfId.ToString("D")).Verified && receiver.Pairings.Get(sender.SelfId.ToString("D")).Verified, "los dos lo marcan como verificado");
 
             // Otro equipo que dice ser el emisor (mismo id, otra clave) es rechazado.
             string clone = Path.Combine(directory, "perfil-clon");

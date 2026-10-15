@@ -23,9 +23,11 @@ namespace Lazo
         public DateTime SeenUtc;
         /// <summary>Huella de la clave que anuncia el equipo (sin verificar hasta conectar).</summary>
         public string Fingerprint = "";
-        /// <summary>Emparejado y con la misma huella que la guardada.</summary>
+        /// <summary>Conocido (ya se conectaron) y con la misma huella que la guardada.</summary>
         public bool Paired;
-        /// <summary>Emparejado antes, pero ahora anuncia otra clave: no se le envía nada.</summary>
+        /// <summary>Además, las dos personas confirmaron el código de verificación.</summary>
+        public bool Verified;
+        /// <summary>Conocido antes, pero ahora anuncia otra clave: no se le envía nada.</summary>
         public bool IdentityChanged;
         public override string ToString() { return Name + "  /  " + Address; }
     }
@@ -55,7 +57,7 @@ namespace Lazo
         public byte[] Preview;
     }
 
-    /// <summary>Petición de emparejamiento: las dos personas comparan el mismo código de 6 cifras.</summary>
+    /// <summary>Verificación opcional: las dos personas comparan el mismo código de 6 cifras.</summary>
     internal sealed class PairingRequest
     {
         public string PeerId;
@@ -74,6 +76,8 @@ namespace Lazo
         public TcpClient Client;
         public SecureStream Stream;
         public string PeerId;
+        internal byte[] Transcript;
+        internal string Fingerprint;
 
         public void Dispose()
         {
@@ -82,9 +86,10 @@ namespace Lazo
         }
     }
 
-    internal sealed class PairingRequiredException : InvalidOperationException
+    /// <summary>Un equipo conocido se presenta con otra clave: no se le envía nada.</summary>
+    internal sealed class IdentityChangedException : InvalidOperationException
     {
-        public PairingRequiredException(string message) : base(message) { }
+        public IdentityChangedException(string message) : base(message) { }
     }
 
     internal sealed class NetworkEngine : IDisposable
@@ -92,7 +97,7 @@ namespace Lazo
         public const int DiscoveryPort = 48351;
         public const int TransferPort = 48352;
         private const long MaxFileSize = 20L * 1024 * 1024 * 1024;
-        private const byte StatusUnpaired = 0, StatusPaired = 1, StatusMismatch = 2;
+        private const byte StatusKnown = 1, StatusMismatch = 2;
         private static readonly Guid DownloadsId = new Guid("374DE290-123F-4565-9164-39C4925E467B");
         private readonly string _profile;
         private readonly Guid _id;
@@ -123,7 +128,7 @@ namespace Lazo
         public event Func<Offer, Task<bool>> OfferReceived;
         public event Action<Guid, double> ReceiveProgress;
         public event Action<Guid, string, string> ReceiveFinished;
-        /// <summary>Pide a la persona que confirme el código. Devuelve true si pulsa «Coincide».</summary>
+        /// <summary>Verificación: pide a la persona que compare el código. Devuelve true si pulsa «Coincide».</summary>
         public event Func<PairingRequest, Task<bool>> PairingPrompt;
 
         public NetworkEngine(string receiveDirectory = null, int discoveryPort = DiscoveryPort, int transferPort = TransferPort, string profileDirectory = null)
@@ -258,6 +263,7 @@ namespace Lazo
             {
                 PairedDevice paired = Pairings.Get(peer.Id.ToString("D"));
                 peer.Paired = paired != null && paired.Fingerprint == peer.Fingerprint;
+                peer.Verified = peer.Paired && paired.Verified;
                 peer.IdentityChanged = paired != null && paired.Fingerprint != peer.Fingerprint;
             }
             Action<List<Peer>> handler = PeersChanged;
@@ -349,23 +355,28 @@ namespace Lazo
                     if (Encoding.ASCII.GetString(magic) != "LAZO3") return;
                     session = SecureSession.Accept(network, _identity);
                     PairedDevice known = Pairings.Get(session.PeerId);
-                    byte status = known == null ? StatusUnpaired : known.Fingerprint == session.PeerFingerprint ? StatusPaired : StatusMismatch;
                     SecureStream stream = session.Stream;
-                    stream.WriteByte(status);
+                    if (known != null && known.Fingerprint != session.PeerFingerprint)
+                    {
+                        stream.WriteByte(StatusMismatch);
+                        stream.Flush();
+                        return;
+                    }
+                    // Primer contacto: se recuerda su clave sin preguntar (como SSH). Si un día cambia, se rechaza.
+                    if (known == null) Pairings.Set(session.PeerId, session.PeerFingerprint, NameOf(session.PeerId));
+                    stream.WriteByte(StatusKnown);
                     stream.Flush();
-                    if (status == StatusMismatch) return;
                     client.ReceiveTimeout = 120000;
                     BinaryReader reader = new BinaryReader(stream, Encoding.UTF8, true);
                     BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8, true);
                     byte op = reader.ReadByte();
                     if (op == (byte)'P')
                     {
+                        // Verificación opcional con código: solo marca el equipo como verificado.
                         string name = CleanLabel(ReadText(reader, 80));
-                        if (name.Length == 0 || !await PairIncomingAsync(session, name).ConfigureAwait(false)) return;
-                        status = StatusPaired;
-                        op = reader.ReadByte();
+                        if (name.Length > 0) await VerifyIncomingAsync(session, name).ConfigureAwait(false);
+                        return;
                     }
-                    if (status != StatusPaired) return;
                     Guid peerId = Guid.Parse(session.PeerId);
                     switch (op)
                     {
@@ -383,7 +394,14 @@ namespace Lazo
             }
         }
 
-        private async Task<bool> PairIncomingAsync(SecureSession session, string name)
+        private string NameOf(string id)
+        {
+            Guid guid;
+            Peer peer;
+            lock (_peerLock) return Guid.TryParse(id, out guid) && _peers.TryGetValue(guid, out peer) ? peer.Name : "Equipo";
+        }
+
+        private async Task<bool> VerifyIncomingAsync(SecureSession session, string name)
         {
             lock (_pairLock)
             {
@@ -401,7 +419,7 @@ namespace Lazo
             try
             {
                 bool ok = await ExchangePairingAsync(session, name, true).ConfigureAwait(false);
-                if (ok) Pairings.Set(session.PeerId, session.PeerFingerprint, name);
+                if (ok) Pairings.MarkVerified(session.PeerId, name);
                 return ok;
             }
             finally
@@ -438,16 +456,15 @@ namespace Lazo
         // ── Cliente: abrir una conexión segura ───────────────────────────
 
         /// <summary>
-        /// Conecta, comprueba la identidad del otro equipo y, si hace falta y <paramref name="interactive"/>,
-        /// lo empareja antes de seguir. Lanza una excepción con un mensaje para la persona si no puede.
+        /// Conecta y comprueba la identidad del otro equipo. La primera vez se recuerda su clave;
+        /// después, si cambia, se rechaza. Lanza una excepción con un mensaje para la persona si no puede.
         /// </summary>
-        private async Task<SecureConnection> OpenAsync(Peer peer, bool interactive, int connectTimeoutMs = 7000)
+        private async Task<SecureConnection> OpenAsync(Peer peer, int connectTimeoutMs = 7000)
         {
             if (peer == null || peer.Address == null) throw new InvalidOperationException("El compañero no está conectado.");
             if (!IsLocalSubnet(peer.Address)) throw new InvalidOperationException("El compañero ya no está en la misma subred.");
             string expected = peer.Id.ToString("D");
             PairedDevice known = Pairings.Get(expected);
-            if (known == null && !interactive) throw new PairingRequiredException("Primero hay que emparejar los equipos.");
             TcpClient client = new TcpClient(AddressFamily.InterNetwork);
             SecureSession session = null;
             try
@@ -462,25 +479,14 @@ namespace Lazo
                 session = await Task.Run(() => SecureSession.Connect(network, _identity)).ConfigureAwait(false);
                 if (session.PeerId != expected) throw new InvalidOperationException("Respondió un equipo distinto del esperado.");
                 if (known != null && known.Fingerprint != session.PeerFingerprint)
-                    throw new InvalidOperationException("La identidad de " + peer.Name + " cambió. Si reinstaló Lazo, quítalo de los equipos emparejados y vuelve a emparejar.");
+                    throw new IdentityChangedException("La identidad de " + peer.Name + " cambió. Si reinstaló Lazo, olvídalo en Ajustes › Equipos conocidos.");
                 int status = session.Stream.ReadByte();
                 if (status == StatusMismatch)
-                    throw new InvalidOperationException(peer.Name + " tiene guardada otra identidad de este equipo. Debe quitarlo de sus equipos emparejados.");
-                if (status != StatusPaired && status != StatusUnpaired) throw new EndOfStreamException();
-                if (status != StatusPaired || known == null)
-                {
-                    if (!interactive) throw new PairingRequiredException("Primero hay que emparejar los equipos.");
-                    client.ReceiveTimeout = 120000;
-                    BinaryWriter writer = new BinaryWriter(session.Stream, Encoding.UTF8, true);
-                    writer.Write((byte)'P');
-                    WriteText(writer, Label(), 80);
-                    writer.Flush();
-                    if (!await ExchangePairingAsync(session, peer.Name, false).ConfigureAwait(false))
-                        throw new PairingRequiredException("No se emparejaron los equipos.");
-                    Pairings.Set(expected, session.PeerFingerprint, peer.Name);
-                }
+                    throw new IdentityChangedException(peer.Name + " tiene guardada otra identidad de este equipo. Debe olvidarlo en sus Ajustes.");
+                if (status != StatusKnown) throw new EndOfStreamException();
+                if (known == null) Pairings.Set(expected, session.PeerFingerprint, peer.Name);
                 client.ReceiveTimeout = 120000;
-                return new SecureConnection { Client = client, Stream = session.Stream, PeerId = session.PeerId };
+                return new SecureConnection { Client = client, Stream = session.Stream, PeerId = session.PeerId, Transcript = session.Transcript, Fingerprint = session.PeerFingerprint };
             }
             catch
             {
@@ -490,10 +496,23 @@ namespace Lazo
             }
         }
 
-        /// <summary>Empareja sin enviar nada más.</summary>
-        public async Task PairAsync(Peer peer)
+        /// <summary>
+        /// Verificación opcional: las dos personas comparan un código de 6 cifras. Si coincide, nadie se
+        /// interpuso en la red y el equipo queda marcado como verificado. Devuelve false si se cancela o no coincide.
+        /// </summary>
+        public async Task<bool> VerifyAsync(Peer peer)
         {
-            using (SecureConnection connection = await OpenAsync(peer, true).ConfigureAwait(false)) { }
+            using (SecureConnection connection = await OpenAsync(peer).ConfigureAwait(false))
+            {
+                BinaryWriter writer = new BinaryWriter(connection.Stream, Encoding.UTF8, true);
+                writer.Write((byte)'P');
+                WriteText(writer, Label(), 80);
+                writer.Flush();
+                SecureSession session = new SecureSession { Stream = connection.Stream, PeerId = connection.PeerId, Transcript = connection.Transcript, PeerFingerprint = connection.Fingerprint };
+                bool ok = await ExchangePairingAsync(session, peer.Name, false).ConfigureAwait(false);
+                if (ok) Pairings.MarkVerified(connection.PeerId, peer.Name);
+                return ok;
+            }
         }
 
         // ── Chat y señales ───────────────────────────────────────────────
@@ -503,7 +522,7 @@ namespace Lazo
             text = (text ?? "").Trim();
             if (text.Length == 0) return;
             if (text.Length > 2000) text = text.Substring(0, 2000);
-            using (SecureConnection connection = await OpenAsync(peer, true).ConfigureAwait(false))
+            using (SecureConnection connection = await OpenAsync(peer).ConfigureAwait(false))
             {
                 BinaryWriter writer = new BinaryWriter(connection.Stream, Encoding.UTF8, true);
                 writer.Write((byte)'C');
@@ -525,14 +544,14 @@ namespace Lazo
             if (handler != null) handler(id, name, body);
         }
 
-        /// <summary>Escribiendo, presencia y zumbido. Nunca pide emparejar: si no lo están, no se envía.</summary>
+        /// <summary>Escribiendo, presencia y zumbido: solo a equipos con los que ya hubo contacto.</summary>
         public async Task SendSignalAsync(Peer peer, byte kind, string body)
         {
             if (peer == null || peer.Address == null || !peer.Paired) return;
             body = body ?? "";
             if (body.Length > 2000) body = body.Substring(0, 2000);
             SecureConnection connection;
-            try { connection = await OpenAsync(peer, false, 4000).ConfigureAwait(false); }
+            try { connection = await OpenAsync(peer, 4000).ConfigureAwait(false); }
             catch { return; }
             using (connection)
             {
@@ -572,7 +591,7 @@ namespace Lazo
         /// </summary>
         public async Task<SecureConnection> OpenScreenAsync(Peer peer, string source)
         {
-            SecureConnection connection = await OpenAsync(peer, true).ConfigureAwait(false);
+            SecureConnection connection = await OpenAsync(peer).ConfigureAwait(false);
             try
             {
                 connection.Client.NoDelay = true;
@@ -630,7 +649,7 @@ namespace Lazo
             FileInfo info = new FileInfo(path);
             if (!info.Exists) throw new FileNotFoundException("El archivo ya no existe.");
             if (info.Length > MaxFileSize) throw new InvalidOperationException("Límite: 20 GB por archivo.");
-            using (SecureConnection connection = await OpenAsync(peer, true).ConfigureAwait(false))
+            using (SecureConnection connection = await OpenAsync(peer).ConfigureAwait(false))
             {
                 connection.Client.ReceiveTimeout = 120000;
                 connection.Client.SendTimeout = 30000;

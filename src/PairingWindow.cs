@@ -10,8 +10,8 @@ using System.Windows.Threading;
 namespace Lazo
 {
     /// <summary>
-    /// Emparejar dos equipos: las dos personas ven el mismo código de 6 cifras y lo confirman.
-    /// Si el código no coincide, alguien se está haciendo pasar por el otro equipo.
+    /// Verificación opcional: las dos personas ven el mismo código de 6 cifras y lo confirman.
+    /// Si el código no coincide, alguien se interpuso en la red entre los dos equipos.
     /// </summary>
     internal sealed class PairingWindow : Window
     {
@@ -23,7 +23,7 @@ namespace Lazo
 
         public PairingWindow(PairingRequest request, int stack)
         {
-            Title = "Lazo · emparejar";
+            Title = "Lazo · verificar";
             Width = 380;
             SizeToContent = SizeToContent.Height;
             WindowStyle = WindowStyle.None;
@@ -37,9 +37,9 @@ namespace Lazo
 
             StackPanel body = new StackPanel();
             body.Children.Add(Theme.Text(request.Incoming
-                ? request.PeerName + " quiere emparejarse con este equipo"
-                : "Emparejar con " + request.PeerName, 13, Theme.Ink, FontWeights.SemiBold));
-            TextBlock help = Theme.Text("Comprueba que en el otro equipo aparece exactamente el mismo código. Si no coincide, cancela.", 11.5, Theme.Muted);
+                ? request.PeerName + " quiere verificar la conexión con este equipo"
+                : "Verificar a " + request.PeerName, 13, Theme.Ink, FontWeights.SemiBold));
+            TextBlock help = Theme.Text("Comprueba con la otra persona que ve exactamente el mismo código. Si no coincide, cancela: alguien se interpuso en la red.", 11.5, Theme.Muted);
             help.Margin = new Thickness(0, 4, 0, 0);
             body.Children.Add(help);
             TextBlock code = Theme.Text(request.Code.Substring(0, 3) + " " + request.Code.Substring(3), 34, Theme.Ink, FontWeights.SemiBold);
@@ -92,7 +92,7 @@ namespace Lazo
                     _remote = yes ? 1 : 0;
                     if (!yes)
                     {
-                        _state.Text = _result.Task.IsCompleted && _result.Task.Result ? "No se emparejaron." : _peerName + " canceló.";
+                        _state.Text = _result.Task.IsCompleted && _result.Task.Result ? "No se verificó." : _peerName + " canceló.";
                         Finish(false);
                         CloseSoon();
                     }
@@ -107,7 +107,7 @@ namespace Lazo
 
         private void Paired()
         {
-            _state.Text = "Equipos emparejados.";
+            _state.Text = "Equipo verificado.";
             CloseSoon();
         }
 
